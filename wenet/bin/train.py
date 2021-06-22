@@ -20,7 +20,14 @@ import logging
 import os
 
 import torch
-import torch.distributed as dist
+
+####### binc changed to smddp #######
+# import torch.distributed as dist
+
+import smdistributed.dataparallel.torch.distributed as dist
+
+#####################################
+
 import torch.optim as optim
 import yaml
 from tensorboardX import SummaryWriter
@@ -31,6 +38,14 @@ from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint, save_checkpoint
 from wenet.utils.executor import Executor
 from wenet.utils.scheduler import WarmupLR
+
+
+# Import SMDataParallel modules for PyTorch.
+from smdistributed.dataparallel.torch.parallel.distributed import DistributedDataParallel as DDP
+
+# SMDataParallel: Initialize
+if not dist.is_initialized():
+    dist.init_process_group()  # binc
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='training your network')
@@ -81,18 +96,26 @@ if __name__ == '__main__':
     parser.add_argument('--cmvn', default=None, help='global cmvn file')
 
     args = parser.parse_args()
+    
+    current_host= os.environ['SM_CURRENT_HOST']
 
     logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+                        format=current_host+': %(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
+    
+
     # Set random seed
     torch.manual_seed(777)
-    print(args)
+    print("args: \n", args)
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
-    distributed = args.world_size > 1
-
+    distributed = dist.get_world_size() > 1  # binc
+    local_rank = dist.get_local_rank()
+    if distributed:
+        # SMDataParallel: Pin each GPU to a single SMDataParallel process.
+        torch.cuda.set_device(local_rank)
+    
+    
     raw_wav = configs['raw_wav']
 
     train_collate_func = CollateFunc(**configs['collate_conf'],
@@ -112,18 +135,16 @@ if __name__ == '__main__':
     train_dataset = AudioDataset(args.train_data,
                                  **dataset_conf,
                                  raw_wav=raw_wav)
+    
     cv_dataset = AudioDataset(args.cv_data, **dataset_conf, raw_wav=raw_wav)
 
     if distributed:
-        logging.info('training on multiple gpus, this gpu {}'.format(args.gpu))
-        dist.init_process_group(args.dist_backend,
-                                init_method=args.init_method,
-                                world_size=args.world_size,
-                                rank=args.rank)
+        logging.info('training on multiple gpus, this gpu {}'.format(local_rank))
+        
         train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset, shuffle=True)
+            train_dataset, shuffle=True, num_replicas=dist.get_world_size(), rank=dist.get_rank()) # binc
         cv_sampler = torch.utils.data.distributed.DistributedSampler(
-            cv_dataset, shuffle=False)
+            cv_dataset, shuffle=False, num_replicas=dist.get_world_size(), rank=dist.get_rank()) # binc
     else:
         train_sampler = None
         cv_sampler = None
@@ -155,7 +176,9 @@ if __name__ == '__main__':
     configs['output_dim'] = vocab_size
     configs['cmvn_file'] = args.cmvn
     configs['is_json_cmvn'] = raw_wav
-    if args.rank == 0:
+    
+    # if args.rank == 0:
+    if dist.get_rank() == 0:  # binc
         saved_config_path = os.path.join(args.model_dir, 'train.yaml')
         with open(saved_config_path, 'w') as fout:
             data = yaml.dump(configs)
@@ -163,15 +186,17 @@ if __name__ == '__main__':
 
     # Init asr model from configs
     model = init_asr_model(configs)
-    print(model)
+    device = torch.device('cuda')
+    model.to(device)
+    
     num_params = sum(p.numel() for p in model.parameters())
     print('the number of model params: {}'.format(num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    script_model = torch.jit.script(model)
-    script_model.save(os.path.join(args.model_dir, 'init.zip'))
+#     script_model = torch.jit.script(model)
+#     script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:
@@ -184,31 +209,38 @@ if __name__ == '__main__':
 
     num_epochs = configs.get('max_epoch', 100)
     model_dir = args.model_dir
+    
     writer = None
-    if args.rank == 0:
+    # if args.rank == 0:
+    if dist.get_rank() == 0:  # binc
         os.makedirs(model_dir, exist_ok=True)
         exp_id = os.path.basename(model_dir)
         writer = SummaryWriter(os.path.join(args.tensorboard_dir, exp_id))
 
+    logging.debug('before if distributed:')
     if distributed:
         assert (torch.cuda.is_available())
-        # cuda model is required for nn.parallel.DistributedDataParallel
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, find_unused_parameters=True)
-        device = torch.device("cuda")
+        #########
+        # model = torch.nn.parallel.DistributedDataParallel(
+        #     model, find_unused_parameters=True)
+
+        model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)  # binc
+        #########
     else:
-        use_cuda = args.gpu >= 0 and torch.cuda.is_available()
+        use_cuda = local_rank >= 0 and torch.cuda.is_available()
         device = torch.device('cuda' if use_cuda else 'cpu')
         model = model.to(device)
 
+    logging.debug('before optimizer')
     optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
     scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
     final_epoch = None
-    configs['rank'] = args.rank
+    # configs['rank'] = args.rank
+    configs['rank'] = dist.get_rank()  # binc
     configs['is_distributed'] = distributed
     configs['use_amp'] = args.use_amp
-    if start_epoch == 0 and args.rank == 0:
+    # if start_epoch == 0 and args.rank == 0:
+    if start_epoch == 0 and dist.get_rank() == 0:   # binc
         save_model_path = os.path.join(model_dir, 'init.pt')
         save_checkpoint(model, save_model_path)
 
@@ -219,6 +251,7 @@ if __name__ == '__main__':
     scaler = None
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
+    logging.debug('before epoch in range')
     for epoch in range(start_epoch, num_epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
@@ -228,7 +261,8 @@ if __name__ == '__main__':
                        writer, configs, scaler)
         total_loss, num_seen_utts = executor.cv(model, cv_data_loader, device,
                                                 configs)
-        if args.world_size > 1:
+#         if args.world_size > 1:
+        if dist.get_world_size() > 1: # binc
             # all_reduce expected a sequence parameter, so we use [num_seen_utts].
             num_seen_utts = torch.Tensor([num_seen_utts]).to(device)
             # the default operator in all_reduce function is sum.
@@ -241,7 +275,8 @@ if __name__ == '__main__':
             cv_loss = total_loss / num_seen_utts
 
         logging.info('Epoch {} CV info cv_loss {}'.format(epoch, cv_loss))
-        if args.rank == 0:
+#         if args.rank == 0:
+        if dist.get_rank() == 0:   # binc
             save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
             save_checkpoint(
                 model, save_model_path, {
@@ -253,6 +288,7 @@ if __name__ == '__main__':
             writer.add_scalars('epoch', {'cv_loss': cv_loss, 'lr': lr}, epoch)
         final_epoch = epoch
 
-    if final_epoch is not None and args.rank == 0:
+#     if final_epoch is not None and args.rank == 0:
+    if final_epoch is not None and dist.get_rank() == 0:   # binc
         final_model_path = os.path.join(model_dir, 'final.pt')
         os.symlink('{}.pt'.format(final_epoch), final_model_path)

@@ -2,9 +2,9 @@
 # Author: binbinzhang@mobvoi.com (Binbin Zhang)
 
 import logging
-from contextlib import nullcontext
+#from contextlib import nullcontext
 # if your python version < 3.7 use the below one
-# from contextlib import suppress as nullcontext
+from contextlib import suppress as nullcontext
 import torch
 from torch.nn.utils import clip_grad_norm_
 
@@ -17,13 +17,16 @@ class Executor:
               args, scaler):
         ''' Train one epoch
         '''
+        
+        logging.info(args)
+        
         model.train()
         clip = args.get('grad_clip', 50.0)
         log_interval = args.get('log_interval', 10)
         rank = args.get('rank', 0)
         accum_grad = args.get('accum_grad', 1)
         is_distributed = args.get('is_distributed', True)
-        use_amp = args.get('use_amp', False)
+        use_amp = False #args.get('use_amp', False)
         logging.info('using accumulate grad, new batch size is {} times'
                      'larger than before'.format(accum_grad))
         if use_amp:
@@ -31,6 +34,8 @@ class Executor:
         num_seen_utts = 0
         num_total_batch = len(data_loader)
         for batch_idx, batch in enumerate(data_loader):
+            logging.debug("batch_idx: " + str(batch_idx))
+            
             key, feats, target, feats_lengths, target_lengths = batch
             feats = feats.to(device)
             target = target.to(device)
@@ -49,17 +54,26 @@ class Executor:
             # processes.
             else:
                 context = nullcontext
+                
+            logging.debug("BEFORE with context():")
             with context():
-                # autocast context
-                # The more details about amp can be found in
-                # https://pytorch.org/docs/stable/notes/amp_examples.html
-                with torch.cuda.amp.autocast(scaler is not None):
-                    loss, loss_att, loss_ctc = model(feats, feats_lengths,
-                                                     target, target_lengths)
-                    loss = loss / accum_grad
                 if use_amp:
+                    # autocast context
+                    # The more details about amp can be found in
+                    # https://pytorch.org/docs/stable/notes/amp_examples.html
+                    with torch.cuda.amp.autocast(scaler is not None):
+                        logging.debug('IN with torch.cuda.amp.autocast(scaler is not None):')
+                        loss, loss_att, loss_ctc = model(feats, feats_lengths,
+                                                         target, target_lengths)
+                        loss = loss / accum_grad
                     scaler.scale(loss).backward()
                 else:
+                    logging.debug('IN loss, loss_att, loss_ctc = model(feats, # no amp')
+                    loss, loss_att, loss_ctc = model(feats, # no amp
+                                                 feats_lengths,
+                                                 target,
+                                                 target_lengths)
+                    loss = loss / accum_grad
                     loss.backward()
 
             num_seen_utts += num_utts
@@ -82,10 +96,14 @@ class Executor:
                     grad_norm = clip_grad_norm_(model.parameters(), clip)
                     if torch.isfinite(grad_norm):
                         optimizer.step()
+                logging.debug("BEFORE optimizer.zero_grad(). idx_grad: " + str(batch_idx))
                 optimizer.zero_grad()
                 scheduler.step()
                 self.step += 1
-            if batch_idx % log_interval == 0:
+                logging.debug("AFTER self.step += 1 , idx_grad: " + str(batch_idx))
+            
+            logging.debug("BEFORE if (batch_idx % log_interval == 0) or True:")
+            if (batch_idx % log_interval == 0) or True:
                 lr = optimizer.param_groups[0]['lr']
                 log_str = 'TRAIN Batch {}/{} loss {:.6f} '.format(
                     batch_idx, num_total_batch,

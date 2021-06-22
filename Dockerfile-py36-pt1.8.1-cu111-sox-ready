@@ -1,0 +1,20 @@
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:1.8.1-gpu-py36-cu111-ubuntu18.04
+
+RUN cd / && \
+    pip install ninja && \
+    apt update && \
+    apt-get install sox libsox-dev libsox-fmt-all pkg-config -y && \
+    CUDNN_VERSION=8.0.5.39 && \
+apt-get install cuda-nvrtc-11-1 cuda-nvrtc-dev-11-1 libcudnn8-dev=$CUDNN_VERSION-1+cuda11.1 -y && \
+    TORCHAUDIO_VERSION=v0.8.1 && \
+    git clone -b ${TORCHAUDIO_VERSION} https://github.com/pytorch/audio torchaudio && \
+    cd torchaudio && \
+    git submodule update --init --recursive && \
+    pip install .
+
+COPY ./requirements.txt /tmp/
+
+RUN pip install -r /tmp/requirements.txt && \
+    pip install sagemaker-training && \
+    apt-get clean
+    

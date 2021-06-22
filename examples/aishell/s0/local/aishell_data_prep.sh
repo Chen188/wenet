@@ -5,19 +5,29 @@
 
 . ./path.sh || exit 1;
 
-if [ $# != 2 ]; then
-  echo "Usage: $0 <audio-path> <text-path>"
-  echo " $0 /export/a05/xna/data/data_aishell/wav /export/a05/xna/data/data_aishell/transcript"
-  exit 1;
-fi
+# if [ $# != 2 ]; then
+#   echo "Usage: $0 <audio-path> <text-path>"
+#   echo " $0 /export/a05/xna/data/data_aishell/wav /export/a05/xna/data/data_aishell/transcript"
+#   exit 1;
+# fi
 
-aishell_audio_dir=$1
-aishell_text=$2/aishell_transcript_v0.8.txt
+aishell_audio_dir=
+aishell_text_path=
 
-train_dir=data/local/train
-dev_dir=data/local/dev
-test_dir=data/local/test
-tmp_dir=data/local/tmp
+# set trail's base dir
+trail_dir=/fsx/trail0
+
+# set shared dir
+shared_dir=/fsx/shared
+
+. ./tools/parse_options.sh || exit 1;
+
+aishell_text=$aishell_text_path/aishell_transcript_v0.8.txt
+
+train_dir=$shared_dir/data/train
+dev_dir=$shared_dir/data/dev
+test_dir=$shared_dir/data/test
+tmp_dir=$shared_dir/data/tmp
 
 mkdir -p $train_dir
 mkdir -p $dev_dir
@@ -53,12 +63,12 @@ for dir in $train_dir $dev_dir $test_dir; do
   sort -u $dir/transcripts.txt > $dir/text
 done
 
-mkdir -p data/train data/dev data/test
+mkdir -p $trail_dir/data/train $trail_dir/data/dev $trail_dir/data/test
 
 for f in wav.scp text; do
-  cp $train_dir/$f data/train/$f || exit 1;
-  cp $dev_dir/$f data/dev/$f || exit 1;
-  cp $test_dir/$f data/test/$f || exit 1;
+  cp $train_dir/$f $trail_dir/data/train/$f || exit 1;
+  cp $dev_dir/$f   $trail_dir/data/dev/$f   || exit 1;
+  cp $test_dir/$f  $trail_dir/data/test/$f  || exit 1;
 done
 
 echo "$0: AISHELL data preparation succeeded"

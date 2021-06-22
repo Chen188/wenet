@@ -1,0 +1,17 @@
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:1.6.0-gpu-py36-cu110-ubuntu18.04
+
+RUN cd / && \
+    pip install ninja && \
+    apt update && \
+    apt-get install sox libsox-dev libsox-fmt-all pkg-config -y && \
+    TORCHAUDIO_VERSION=v0.6.0 && \
+    git clone -b ${TORCHAUDIO_VERSION} https://github.com/pytorch/audio torchaudio && \
+    cd torchaudio && \
+    pip install .
+
+COPY ./requirements.txt /tmp/
+
+RUN pip install -r /tmp/requirements.txt && \
+    pip install sagemaker-training && \
+    apt-get clean
+    
