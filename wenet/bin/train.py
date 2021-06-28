@@ -82,8 +82,10 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    current_host= os.environ['SM_CURRENT_HOST']
+
     logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
+                        format=current_host+': %(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     # Set random seed
     torch.manual_seed(777)

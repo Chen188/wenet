@@ -50,12 +50,21 @@ git clone https://github.com/wenet-e2e/wenet.git
 ``` sh
 # [option 1]
 conda create -n wenet python=3.8
+
+# if using sagemaker notebook
+#source activate wenet
+
 conda activate wenet
+
 pip install -r requirements.txt
 conda install pytorch==1.6.0 cudatoolkit=10.1 torchaudio=0.6.0 -c pytorch
 
 # [option 2: working on machine with GPU 3090]
 conda create -n wenet python=3.8
+
+# if using sagemaker notebook
+#source activate wenet
+
 conda activate wenet
 pip install -r requirements.txt
 conda install pytorch torchvision torchaudio=0.8.0 cudatoolkit=11.1 -c pytorch -c conda-forge

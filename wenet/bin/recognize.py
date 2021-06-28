@@ -83,8 +83,10 @@ if __name__ == '__main__':
                                 decode mode''')
     args = parser.parse_args()
     print(args)
+ 
+    current_host= os.environ['SM_CURRENT_HOST']
     logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
+                        format=current_host+': %(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
     if args.mode in ['ctc_prefix_beam_search', 'attention_rescoring'

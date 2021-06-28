@@ -1,11 +1,12 @@
 #!/bin/bash
+# set -x
 
 # Copyright 2019 Mobvoi Inc. All Rights Reserved.
 . ./path.sh || exit 1;
 
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+CUDA_VISIBLE_DEVICES="0"
 # The NCCL_SOCKET_IFNAME variable specifies which IP interface to use for nccl
 # communication. More details can be found in
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
@@ -21,13 +22,37 @@ num_nodes=1
 # The first node/machine sets node_rank 0, the second one sets node_rank 1
 # the third one set node_rank 2, and so on. Default 0
 node_rank=0
+
+ddp_master_ip=
+ddp_master_port=12345
+
+#hack node_rank for sagemaker
+sm_resource_file=/opt/ml/input/config/resourceconfig.json
+if [ -f "$sm_resource_file" ]; then
+    cat $sm_resource_file
+    
+    current_host=`grep  -Eo 'current_host[^0-9]*[0-9]+' $sm_resource_file | grep -Eo '[0-9]+'`
+    node_rank=`expr $current_host - 1`
+    
+    if [ 0 -eq $node_rank ]; then
+        # treat this as the master node
+        ddp_master_ip=`ifconfig $SM_NETWORK_INTERFACE_NAME | grep -Eo 'inet [0-9]+.[0-9]+.[0-9]+.[0-9]+' | cut -f 2 -d' '`
+    fi
+    
+    sm_job_name=`echo $SM_TRAINING_ENV | grep -Po '"job_name":"[^"]*' | cut -d'"' -f 4`
+fi
+
 # data
-data=/export/data/asr-data/OpenSLR/33/
+data=/fsx/asr-data/OpenSLR/33
 data_url=www.openslr.org/resources/33
 
+# set trail's base dir
+trail_dir=/fsx/local-train/trail0
+
+# set shared dir
+shared_dir=/fsx/local-train/shared
+
 nj=16
-feat_dir=raw_wav
-dict=data/dict/lang_char.txt
 
 train_set=train
 # Optional train_config
@@ -36,18 +61,29 @@ train_set=train
 # 3. conf/train_unified_conformer.yaml: Unified dynamic chunk causal conformer
 # 4. conf/train_unified_transformer.yaml: Unified dynamic chunk transformer
 # 5. conf/train_conformer_no_pos.yaml: Conformer without relative positional encoding
-train_config=conf/train_conformer.yaml
+# train_config=conf/train_conformer.yaml
+train_config=conf/train_unified_transformer.yaml
+
 cmvn=true
-dir=exp/conformer
+
 checkpoint=
+ddp_init_protocol=file
 
 # use average_checkpoint will get better result
 average_checkpoint=true
-decode_checkpoint=$dir/final.pt
 average_num=30
 decode_modes="ctc_greedy_search ctc_prefix_beam_search attention attention_rescoring"
 
 . tools/parse_options.sh || exit 1;
+
+tensorboard_dir=$trail_dir/tensorboard
+feat_dir=$trail_dir/raw_wav
+dict=$trail_dir/data/dict/lang_char.txt
+
+dir=$trail_dir/exp/unified_transformer  # train output dir
+decode_checkpoint=$dir/final.pt
+
+export CUDA_VISIBLE_DEVICES
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
     echo "stage -1: Data Download"
@@ -57,26 +93,26 @@ fi
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     # Data preparation
-    local/aishell_data_prep.sh ${data}/data_aishell/wav ${data}/data_aishell/transcript
+    local/aishell_data_prep.sh --aishell_audio_dir ${data}/data_aishell/wav --aishell_text_path ${data}/data_aishell/transcript --trail_dir $trail_dir --shared_dir $shared_dir
 fi
 
 
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     # remove the space between the text labels for Mandarin dataset
     for x in train dev test; do
-        cp data/${x}/text data/${x}/text.org
-        paste -d " " <(cut -f 1 -d" " data/${x}/text.org) <(cut -f 2- -d" " data/${x}/text.org | tr -d " ") \
-            > data/${x}/text
-        rm data/${x}/text.org
+        cp $trail_dir/data/${x}/text $trail_dir/data/${x}/text.org
+        paste -d " " <(cut -f 1 -d" " $trail_dir/data/${x}/text.org) <(cut -f 2- -d" " $trail_dir/data/${x}/text.org | tr -d " ") \
+            > $trail_dir/data/${x}/text
+        rm $trail_dir/data/${x}/text.org
     done
     # For wav feature, just copy the data. Fbank extraction is done in training
     mkdir -p $feat_dir
     for x in ${train_set} dev test; do
-        cp -r data/$x $feat_dir
+        cp -r $trail_dir/data/$x $feat_dir
     done
 
     tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
-        --in_scp data/${train_set}/wav.scp \
+        --in_scp $trail_dir/data/${train_set}/wav.scp \
         --out_cmvn $feat_dir/$train_set/global_cmvn
 
 fi
@@ -87,7 +123,7 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     mkdir -p $(dirname $dict)
     echo "<blank> 0" > ${dict} # 0 will be used for "blank" in CTC
     echo "<unk> 1" >> ${dict} # <unk> must be 1
-    tools/text2token.py -s 1 -n 1 data/train/text | cut -f 2- -d" " | tr " " "\n" \
+    tools/text2token.py -s 1 -n 1 $trail_dir/data/train/text | cut -f 2- -d" " | tr " " "\n" \
         | sort | uniq | grep -a -v -e '^\s*$' | awk '{print $0 " " NR+1}' >> ${dict}
     num_token=$(cat $dict | wc -l)
     echo "<sos/eos> $num_token" >> $dict # <eos>
@@ -115,10 +151,35 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     # Training
     mkdir -p $dir
-    INIT_FILE=$dir/ddp_init
-    # You had better rm it manually before you start run.sh on first node.
-    # rm -f $INIT_FILE # delete old one before starting
-    init_method=file://$(readlink -f $INIT_FILE)
+    
+    if [ "$ddp_init_protocol" = "tcp" ]; then
+        # we'll write master's ip to this file
+        ip_master_file=$dir/${sm_job_name}_ip_master
+        echo "ip_master_file is: $ip_master_file"
+
+        if [ 0 -eq $node_rank ]; then
+            # treat this as the master node
+            echo 'this is mater node, and will write file'
+            ddp_master_ip=`ifconfig $SM_NETWORK_INTERFACE_NAME | grep -Eo 'inet [0-9]+.[0-9]+.[0-9]+.[0-9]+' | cut -f 2 -d' '`
+            echo $ddp_master_ip > $ip_master_file
+        else
+            # wait for master ip
+            echo 'this is worker node, and will read ip file'
+            while [ ! -f $ip_master_file ]; do
+                echo 'still waiting for master ip file...'
+                sleep 1
+            done
+            
+            ddp_master_ip=`cat $ip_master_file`
+        fi
+        
+        init_method=tcp://$ddp_master_ip:$ddp_master_port
+    else
+        #file mode
+        INIT_FILE=$dir/ddp_init
+        init_method=file://$(readlink -f $INIT_FILE)
+    fi
+    
     echo "$0: init method is $init_method"
     # The number of gpus runing on each node/machine
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
@@ -153,6 +214,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
             --ddp.rank $rank \
             --ddp.dist_backend $dist_backend \
             --num_workers 2 \
+            --tensorboard_dir $tensorboard_dir \
             $cmvn_opts \
             --pin_memory
     } &
