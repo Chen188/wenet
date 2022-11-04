@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# set -x
+
 # Copyright 2021 Mobvoi Inc. All Rights Reserved.
 
 . ./path.sh || exit 1;
@@ -19,6 +21,27 @@ num_nodes=1
 # the third one set node_rank 2, and so on. Default 0
 node_rank=0
 
+##### binc: add sagemaker support ######
+ddp_master_ip=
+ddp_master_port=12345
+
+#hack node_rank for sagemaker
+sm_resource_file=/opt/ml/input/config/resourceconfig.json
+if [ -f "$sm_resource_file" ]; then
+    cat $sm_resource_file
+
+    current_host=`grep  -Eo 'current_host[^0-9]*[0-9]+' $sm_resource_file | grep -Eo '[0-9]+'`
+    node_rank=`expr $current_host - 1`
+
+    if [ 0 -eq $node_rank ]; then
+        # treat this as the master node
+        ddp_master_ip=`ifconfig $SM_NETWORK_INTERFACE_NAME | grep -Eo 'inet [0-9]+.[0-9]+.[0-9]+.[0-9]+' | cut -f 2 -d' '`
+    fi
+
+    sm_job_name=`echo $SM_TRAINING_ENV | grep -Po '"job_name":"[^"]*' | cut -d'"' -f 4`
+fi
+###########
+
 # data
 # use your own data path, you can contact gigaspeech@speechcolab.orgfor getting data for data information about gigaspeech
 # the preparation of gigaspeech dataset for wenet can be found https://github.com/SpeechColab/GigaSpeech
@@ -26,7 +49,6 @@ giga_data_dir=/export/expts6/corpus/data/en-asr-data/16k/GigaSpeech
 shards_dir=/ssd/nfs06/unified_data/giga_shards
 # gigaspeech training set
 set=XL
-train_set=train_`echo $set |tr 'A-Z' 'a-z'`
 train_dev=dev
 recog_set=test
 # wav data dir
@@ -41,14 +63,20 @@ cmvn=false
 do_delta=false
 dir=exp/sp_spec_aug
 
+### binc: add capability to change ddp init protocol , default to file
+ddp_init_protocol=file
+
 # use average_checkpoint will get better result
 average_checkpoint=true
-decode_checkpoint=$dir/final.pt
 # maybe you can try to adjust it if you can not get close results as README.md
 average_num=3
 decode_modes="attention_rescoring ctc_greedy_search"
 
 . tools/parse_options.sh || exit 1;
+
+train_set=train_`echo $set |tr 'A-Z' 'a-z'`
+
+decode_checkpoint=$dir/final.pt
 
 # bpemode (unigram or bpe)
 nbpe=5000
@@ -57,6 +85,8 @@ bpemode=unigram
 set -e
 set -u
 set -o pipefail
+
+cpu_num=`grep -c ^processor /proc/cpuinfo`
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
   ### Task dependent. You have to make data the following preparation part by yourself.
@@ -87,13 +117,15 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
 
   # optional
   # compute cmvn, perhaps you can sample some segmented examples fron wav.scp for cmvn computation
-  python tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
+  ### binc: the num_workers should be less then or equal to vCPU amount ###
+  python tools/compute_cmvn_stats.py --num_workers $cpu_num --train_config $train_config \
     --in_scp $data/$train_set/wav.segment.scp \
     --out_cmvn $data/$train_set/global_cmvn
 fi
 
 
 dict=$data/lang_char_$set/${train_set}_${bpemode}${nbpe}_units.txt
+
 bpemodel=$data/lang_char_$set/${train_set}_${bpemode}${nbpe}
 echo "dictionary: ${dict}"
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
@@ -126,18 +158,46 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     dst=$shards_dir/$x
     mkdir -p $dst
     tools/make_shard_list.py --resample 16000 --num_utts_per_shard 1000 \
-      --num_threads 32 --segments data/$x/segments \
-      data/$x/wav.scp data/$x/text \
-      $(realpath $dst) data/$x/data.list
+      --num_threads $cpu_num --segments $data/$x/segments \
+      $data/$x/wav.scp $data/$x/text \
+      $(realpath $dst) $data/$x/data.list
   done
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   # Training
   mkdir -p $dir
-  INIT_FILE=$dir/ddp_init
-  rm -f $INIT_FILE # delete old one before starting
-  init_method=file://$(readlink -f $INIT_FILE)
+  
+  ###binc: add tcp support
+  if [ "$ddp_init_protocol" = "tcp" ]; then
+    # we'll write master's ip to this file
+    ip_master_file=$dir/${sm_job_name}_ip_master
+    echo "ip_master_file is: $ip_master_file"
+
+    if [ 0 -eq $node_rank ]; then
+      # treat this as the master node
+      echo 'this is mater node, and will write file'
+      ddp_master_ip=`ifconfig $SM_NETWORK_INTERFACE_NAME | grep -Eo 'inet [0-9]+.[0-9]+.[0-9]+.[0-9]+' | cut -f 2 -d' '`
+      echo $ddp_master_ip > $ip_master_file
+    else
+      # wait for master ip
+      echo 'this is worker node, and will read ip file'
+      while [ ! -f $ip_master_file ]; do
+          echo 'still waiting for master ip file...'
+          sleep 1
+      done
+
+      ddp_master_ip=`cat $ip_master_file`
+    fi
+
+    init_method=tcp://$ddp_master_ip:$ddp_master_port
+  else
+    #file mode
+    INIT_FILE=$dir/ddp_init
+    rm -f $INIT_FILE # delete old one before starting
+    init_method=file://$(readlink -f $INIT_FILE)
+  fi
+
   echo "$0: init method is $init_method"
   num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
   # Use "nccl" if it works, otherwise use "gloo"
@@ -159,7 +219,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     gpu_id=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f$[$i+1])
     # Rank of each gpu/process used for knowing whether it is
     # the master of a worker.
-    rank=`expr $node_rank \* $num_gpus + $i`
+    # rank=`expr $node_rank \* $num_gpus + $i` # when set -e, and expr return 0, will cause script exit
+    rank=$(( $node_rank * $num_gpus + $i ))
+    
     python wenet/bin/train.py --gpu $gpu_id \
       --config $train_config \
       --data_type "shard" \
